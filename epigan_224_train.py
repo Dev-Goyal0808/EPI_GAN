@@ -48,6 +48,7 @@ import math
 import random
 import shutil
 import time
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -452,28 +453,57 @@ def evaluate_fid_kid(generator, feature_net, real_images, real_labels, latent_di
     return fid, kid_mean, kid_std, n
 
 
+class TqdmLoggingHandler(logging.Handler):
+    """Send log messages through tqdm without corrupting progress bars."""
+    def emit(self, record):
+        try:
+            tqdm.write(self.format(record))
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
+def setup_logger(output_root: Path) -> logging.Logger:
+    output_root.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("epigan")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    console = TqdmLoggingHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    file_handler = logging.FileHandler(output_root / "training.log", mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+    return logger
+
+
 def train(args):
     seed_everything(args.seed)
+    output_root = Path(args.output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(output_root)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[DEVICE] {device}")
+    logger.info("Device: %s", device)
     if torch.cuda.is_available():
-        print(f"[GPU] {torch.cuda.get_device_name(0)}")
-        print(f"[GPU VRAM] {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GiB")
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
+        logger.info("Visible GPU memory: %.1f GiB", torch.cuda.get_device_properties(0).total_memory / 1024**3)
 
     csv_path = Path(args.groundtruth).expanduser().resolve()
     image_root = Path(args.images_dir).expanduser().resolve()
-    output_root = Path(args.output_dir).expanduser().resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
 
     df, _ = read_labels(csv_path, image_root)
     train_df, val_df, test_df, split_kind = split_dataframe(df, args.seed)
     # Set a split-specific seed in metadata rather than hard-code the value.
     split_root = materialize_splits(train_df, val_df, test_df, output_root, args.force_rebuild_splits)
     save_split_counts(train_df, val_df, test_df, output_root, split_kind, args.seed)
-    print(f"[SPLIT] {split_kind}; real images: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
-    print("[TRAIN COUNTS]", train_df["label"].value_counts().reindex(CLASSES, fill_value=0).to_dict())
-    print("[VAL COUNTS]", val_df["label"].value_counts().reindex(CLASSES, fill_value=0).to_dict())
-    print("[TEST COUNTS]", test_df["label"].value_counts().reindex(CLASSES, fill_value=0).to_dict())
+    logger.info("Split: %s; real images: train=%d, val=%d, test=%d", split_kind, len(train_df), len(val_df), len(test_df))
+    logger.info("Train class counts: %s", train_df["label"].value_counts().reindex(CLASSES, fill_value=0).to_dict())
+    logger.info("Validation class counts: %s", val_df["label"].value_counts().reindex(CLASSES, fill_value=0).to_dict())
+    logger.info("Test class counts: %s", test_df["label"].value_counts().reindex(CLASSES, fill_value=0).to_dict())
 
     class_to_idx = {c: i for i, c in enumerate(CLASSES)}
     train_ds = SkinDataset(train_df, class_to_idx, 224)
@@ -516,16 +546,25 @@ def train(args):
     best_fid = float("inf")
     start_time = time.time()
 
+    last_fid = float("nan")
+    last_kid = float("nan")
+    last_kid_std = float("nan")
+
+    logger.info("Starting training: epochs=%d, batch_size=%d, workers=%d, AMP=%s", args.epochs, args.batch_size, args.num_workers, use_amp)
+    logger.info("Progress fields: G/D loss, discriminator real/fake accuracy, epoch time, latest FID/KID")
+
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
         G.train()
         D.train()
         g_loss_sum = d_loss_sum = 0.0
+        real_acc_sum = fake_acc_sum = 0.0
         n_batches = 0
-        for real, labels in loader:
+        progress = tqdm(loader, desc=f"Epoch {epoch:04d}/{args.epochs}", dynamic_ncols=True, leave=True)
+        for real, labels in progress:
             real = real.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             bs = real.shape[0]
-            # Train discriminator with matching real/fake class labels.
             z = torch.randn(bs, latent_dim, device=device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 fake = G(z, labels).detach()
@@ -533,7 +572,6 @@ def train(args):
                 fake_aug = diff_augment(fake)
                 real_score = D(real_aug, labels)
                 fake_score = D(fake_aug, labels)
-                # Hinge loss is generally more stable than BCE for GAN training.
                 d_loss = F.relu(1.0 - real_score).mean() + F.relu(1.0 + fake_score).mean()
             d_opt.zero_grad(set_to_none=True)
             scaler_d.scale(d_loss).backward()
@@ -544,8 +582,8 @@ def train(args):
 
             z = torch.randn(bs, latent_dim, device=device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                fake = G(z, labels)
-                g_loss = -D(diff_augment(fake), labels).mean()
+                fake_for_g = G(z, labels)
+                g_loss = -D(diff_augment(fake_for_g), labels).mean()
             g_opt.zero_grad(set_to_none=True)
             scaler_g.scale(g_loss).backward()
             scaler_g.unscale_(g_opt)
@@ -553,32 +591,47 @@ def train(args):
             scaler_g.step(g_opt)
             scaler_g.update()
 
+            # Hinge discriminator accuracy: real scores should be > 0, fake scores < 0.
+            real_acc = (real_score.detach() > 0).float().mean().item()
+            fake_acc = (fake_score.detach() < 0).float().mean().item()
             g_loss_sum += float(g_loss.detach())
             d_loss_sum += float(d_loss.detach())
+            real_acc_sum += real_acc
+            fake_acc_sum += fake_acc
             n_batches += 1
+            elapsed = time.time() - epoch_start
+            progress.set_postfix({
+                "G": f"{g_loss_sum / n_batches:.3f}",
+                "D": f"{d_loss_sum / n_batches:.3f}",
+                "Acc(R/F)": f"{100*real_acc_sum/n_batches:.0f}/{100*fake_acc_sum/n_batches:.0f}%",
+                "time": f"{elapsed/60:.1f}m",
+                "FID": f"{last_fid:.2f}" if math.isfinite(last_fid) else "pending",
+            })
+        progress.close()
 
+        epoch_seconds = time.time() - epoch_start
         row = {
             "epoch": epoch,
             "g_loss": g_loss_sum / max(n_batches, 1),
             "d_loss": d_loss_sum / max(n_batches, 1),
-            "fid": float("nan"),
-            "kid_mean": float("nan"),
-            "kid_std": float("nan"),
+            "discriminator_real_accuracy": real_acc_sum / max(n_batches, 1),
+            "discriminator_fake_accuracy": fake_acc_sum / max(n_batches, 1),
+            "epoch_seconds": epoch_seconds,
+            "fid": last_fid,
+            "kid_mean": last_kid,
+            "kid_std": last_kid_std,
             "metric_n_per_distribution": len(metric_real),
         }
-        print(
-            f"Epoch {epoch:04d}/{args.epochs} | "
-            f"G={row['g_loss']:.4f} D={row['d_loss']:.4f}",
-            end="",
-        )
+
         if epoch == 1 or epoch % args.metrics_every == 0 or epoch == args.epochs:
             try:
                 fid, kid_mean, kid_std, metric_n = evaluate_fid_kid(
                     G, metric_net, metric_real, metric_labels, latent_dim,
                     len(CLASSES), args.metric_batch_size, device
                 )
+                last_fid, last_kid, last_kid_std = fid, kid_mean, kid_std
                 row.update(fid=fid, kid_mean=kid_mean, kid_std=kid_std, metric_n_per_distribution=metric_n)
-                print(f" | FID={fid:.3f} | KID={kid_mean:.6f} ± {kid_std:.6f} (n={metric_n})")
+                logger.info("Epoch %d metrics | FID=%.4f | KID=%.6f +/- %.6f | samples/distribution=%d", epoch, fid, kid_mean, kid_std, metric_n)
                 if fid < best_fid:
                     best_fid = fid
                     torch.save({
@@ -591,14 +644,24 @@ def train(args):
                         "kid_mean": kid_mean,
                         "kid_std": kid_std,
                     }, output_root / "epigan_224_best_fid.pt")
-            except Exception as exc:
-                print(f" | METRIC ERROR: {exc}")
-                print("  Check torchvision/Inception weights and validation sample count.")
-        else:
-            print()
+                    logger.info("Saved new best-FID checkpoint at epoch %d (FID=%.4f)", epoch, fid)
+            except Exception:
+                logger.exception("FID/KID evaluation failed at epoch %d; check Inception weights and validation sample count.", epoch)
 
+        # Refresh metric columns with latest values between evaluation epochs.
+        if not math.isfinite(row["fid"]):
+            row["fid"] = last_fid
+            row["kid_mean"] = last_kid
+            row["kid_std"] = last_kid_std
         history.append(row)
         pd.DataFrame(history).to_csv(output_root / "training_metrics.csv", index=False)
+        logger.info(
+            "Epoch %d/%d complete | G=%.4f D=%.4f | D-Acc real=%.3f fake=%.3f | epoch_time=%.1fs | FID=%s | KID=%s",
+            epoch, args.epochs, row["g_loss"], row["d_loss"], row["discriminator_real_accuracy"],
+            row["discriminator_fake_accuracy"], epoch_seconds,
+            f"{row['fid']:.4f}" if math.isfinite(row["fid"]) else "pending",
+            f"{row['kid_mean']:.6f} +/- {row['kid_std']:.6f}" if math.isfinite(row["kid_mean"]) else "pending",
+        )
         if epoch % args.checkpoint_every == 0 or epoch == args.epochs:
             torch.save({
                 "epoch": epoch,
@@ -607,17 +670,19 @@ def train(args):
                 "class_to_idx": class_to_idx,
                 "config": vars(args),
             }, output_root / f"epigan_224_epoch_{epoch:04d}.pt")
+            logger.info("Saved checkpoint for epoch %d", epoch)
         if epoch % args.sample_every == 0 or epoch == 1:
             save_sample_grid(G, output_root / "samples", epoch, latent_dim, len(CLASSES), device)
+            logger.info("Saved generated sample grid for epoch %d", epoch)
 
     # Plot continuous metric histories. Missing evaluations remain NaN.
     plot_training_curves(pd.DataFrame(history), output_root)
     save_augmented_training_images(
         G, train_df, class_to_idx, output_root, split_root, latent_dim, device, args
     )
-    print(f"[DONE] Elapsed: {(time.time() - start_time) / 3600:.2f} h")
-    print(f"[DONE] Outputs: {output_root}")
-    print("[IMPORTANT] Downstream classifier test data must be split_root/test only (real images).")
+    logger.info("Training and image generation complete. Total elapsed time: %.2f hours", (time.time() - start_time) / 3600)
+    logger.info("Outputs: %s", output_root)
+    logger.info("Downstream classifier test data must use dataset_split/test only (real images).")
 
 
 @torch.no_grad()
@@ -712,7 +777,7 @@ def save_augmented_training_images(generator, train_df, class_to_idx, output_roo
             "post_augmentation_train_total": current + saved,
             "real_to_synthetic_ratio": (f"{current}:{saved}" if saved else f"{current}:0"),
         })
-        print(f"[GENERATE] {cls}: real train={current}, synthetic={saved}, post={current+saved}")
+        logging.getLogger("epigan").info("Generated %s: real_train=%d synthetic=%d post_augmentation=%d", cls, current, saved, current + saved)
     pd.DataFrame(rows).to_csv(output_root / "post_augmentation_class_counts.csv", index=False)
     generator.train()
 
